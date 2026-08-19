@@ -130,11 +130,17 @@ namespace pipewire {
    */
   struct img_descriptor_t: public egl::img_descriptor_t {
     ~img_descriptor_t() override {
-      if (data) {
+      // Only free buffers this image actually owns. The memory-buffer capture
+      // path points img->data at the PipeWire staging vector (front_buffer),
+      // which is owned by pipewire_t -- deleting it here corrupts the heap.
+      if (data && data_owned) {
         delete[] data;
-        data = nullptr;
       }
+      data = nullptr;
+      data_owned = false;
     }
+
+    bool data_owned = false;  ///< Whether img->data is owned by this image and must be freed.
   };
 
   /**
@@ -422,13 +428,17 @@ namespace pipewire {
 
       struct spa_buffer *buf = stream_data.current_buffer->buffer;
       if (buf->datas[0].chunk->size != 0) {
-        auto *img_descriptor = static_cast<egl::img_descriptor_t *>(img);
+        auto *img_descriptor = static_cast<img_descriptor_t *>(img);
         fill_img_metadata(img_descriptor, buf);
         if (buf->datas[0].type == SPA_DATA_DmaBuf) {
           fill_img_dmabuf(img_descriptor, buf, stream_data);
         } else {
           img->data = stream_data.front_buffer->data();
+          img_descriptor->data_owned = false;
           img->row_pitch = stream_data.local_stride;
+          // NV12 is the only 1-byte-per-pixel format delivered on the memory
+          // path; every other negotiated format is packed 4 bytes per pixel.
+          img->pixel_pitch = (stream_data.format.info.raw.format == SPA_VIDEO_FORMAT_NV12) ? 1 : 4;
         }
       }
 
@@ -747,37 +757,43 @@ namespace pipewire {
      */
     virtual void verify_and_update_display_parameters() {
       // Query outputs directly using wayland wl::monitors()
-      if (logical_height <= 0 || logical_width <= 0 || env_logical_height <= 0 || env_logical_width <= 0 || env_height <= 0 || env_width <= 0) {
-        int desktop_width = 0;
-        int desktop_height = 0;
-        int desktop_logical_width = 0;
-        int desktop_logical_height = 0;
-        for (const auto &monitor : wl::monitors()) {
-          BOOST_LOG(debug) << "[pipewire] Found output: '"sv << monitor->name << "' offset: "sv << monitor->viewport.offset_x << 'x' << monitor->viewport.offset_y << " resolution: "sv << monitor->viewport.width << 'x' << monitor->viewport.height << " logical resolution: "sv << monitor->viewport.logical_width << 'x' << monitor->viewport.logical_height;
-          // If logical_width and logical_height are not valid try to update them to correct values by matching to monitor
-          // position/dimension or position/logical dimensions here since we're iterating for maximum environment size anyway
-          if ((logical_width <= 0 || logical_height <= 0) && monitor->viewport.offset_x == offset_x && monitor->viewport.offset_y == offset_y && ((monitor->viewport.width == width && monitor->viewport.height == height) || (monitor->viewport.logical_width == width && monitor->viewport.logical_height == height))) {
-            this->logical_width = monitor->viewport.logical_width;
-            this->logical_height = monitor->viewport.logical_height;
-            BOOST_LOG(debug) << "[pipewire] Set logical resolution: "sv << logical_width << 'x' << logical_height;
-          }
-          // Update desktop dimensions to setup maximum environment size over all screens
-          desktop_width = std::max(desktop_width, monitor->viewport.offset_x + monitor->viewport.width);
-          desktop_height = std::max(desktop_height, monitor->viewport.offset_y + monitor->viewport.height);
-          // Update desktop logical dimensions to setup maximum logical environment size over all screens
-          desktop_logical_width = std::max(desktop_logical_width, monitor->viewport.offset_x + monitor->viewport.logical_width);
-          desktop_logical_height = std::max(desktop_logical_height, monitor->viewport.offset_y + monitor->viewport.logical_height);
+      int desktop_width = 0;
+      int desktop_height = 0;
+      int desktop_logical_width = 0;
+      int desktop_logical_height = 0;
+      std::string target_output = config::video.output_name;
+      bool matched = false;
+
+      for (const auto &monitor : wl::monitors()) {
+        BOOST_LOG(debug) << "[pipewire] Found output: '"sv << monitor->name << "' offset: "sv << monitor->viewport.offset_x << 'x' << monitor->viewport.offset_y << " resolution: "sv << monitor->viewport.width << 'x' << monitor->viewport.height << " logical resolution: "sv << monitor->viewport.logical_width << 'x' << monitor->viewport.logical_height;
+
+        bool is_target = (!target_output.empty() && monitor->name == target_output) ||
+                         (target_output.empty() && monitor->name.rfind("Meta", 0) == 0);
+
+        if (is_target || (!matched && (logical_width <= 0 || logical_height <= 0) && monitor->viewport.offset_x == offset_x && monitor->viewport.offset_y == offset_y && ((monitor->viewport.width == width && monitor->viewport.height == height) || (monitor->viewport.logical_width == width && monitor->viewport.logical_height == height)))) {
+          this->offset_x = monitor->viewport.offset_x;
+          this->offset_y = monitor->viewport.offset_y;
+          this->logical_width = monitor->viewport.logical_width;
+          this->logical_height = monitor->viewport.logical_height;
+          matched = true;
+          BOOST_LOG(info) << "[pipewire] Matched output '"sv << monitor->name << "' offset: "sv << offset_x << 'x' << offset_y << " logical: "sv << logical_width << 'x' << logical_height;
         }
-        if (env_height <= 0 || env_width <= 0) {
-          this->env_width = desktop_width;
-          this->env_height = desktop_height;
-          BOOST_LOG(debug) << "[pipewire] Set desktop resolution: "sv << env_width << 'x' << env_height;
-        }
-        if (env_logical_height <= 0 || env_logical_width <= 0) {
-          this->env_logical_width = desktop_logical_width;
-          this->env_logical_height = desktop_logical_height;
-          BOOST_LOG(debug) << "[pipewire] Set desktop logical resolution: "sv << env_logical_width << 'x' << env_logical_height;
-        }
+        // Update desktop dimensions to setup maximum environment size over all screens
+        desktop_width = std::max(desktop_width, monitor->viewport.offset_x + monitor->viewport.width);
+        desktop_height = std::max(desktop_height, monitor->viewport.offset_y + monitor->viewport.height);
+        // Update desktop logical dimensions to setup maximum logical environment size over all screens
+        desktop_logical_width = std::max(desktop_logical_width, monitor->viewport.offset_x + monitor->viewport.logical_width);
+        desktop_logical_height = std::max(desktop_logical_height, monitor->viewport.offset_y + monitor->viewport.logical_height);
+      }
+      if (env_height <= 0 || env_width <= 0) {
+        this->env_width = desktop_width;
+        this->env_height = desktop_height;
+        BOOST_LOG(debug) << "[pipewire] Set desktop resolution: "sv << env_width << 'x' << env_height;
+      }
+      if (env_logical_height <= 0 || env_logical_width <= 0) {
+        this->env_logical_width = desktop_logical_width;
+        this->env_logical_height = desktop_logical_height;
+        BOOST_LOG(debug) << "[pipewire] Set desktop logical resolution: "sv << env_logical_width << 'x' << env_logical_height;
       }
     }
 
@@ -929,6 +945,7 @@ namespace pipewire {
       img->sequence = 0;
       img->serial = std::numeric_limits<decltype(img->serial)>::max();
       img->data = nullptr;
+      img->data_owned = false;
       std::fill_n(img->sd.fds, 4, -1);
 
       return img;
@@ -1053,7 +1070,20 @@ namespace pipewire {
      * @return Capture status reported to the streaming pipeline.
      */
     int dummy_img(platf::img_t *img) override {
-      // Empty images are recognized as dummies by the zero sequence number
+      // Software encoders convert the dummy image immediately; provide a valid
+      // (black) buffer instead of leaving img->data null, which makes sws fail
+      // with EINVAL. The buffer is new[]-allocated and marked as owned so the
+      // destructor releases it.
+      if (img->data == nullptr) {
+        const auto w = img->width;
+        const auto h = img->height;
+        if (w > 0 && h > 0) {
+          img->data = new uint8_t[static_cast<size_t>(w) * h * 4]();  // NOSONAR(cpp:S5025) - buffer is owned by the image and freed by img_descriptor_t's destructor
+          static_cast<img_descriptor_t *>(img)->data_owned = true;
+          img->row_pitch = w * 4;
+          img->pixel_pitch = 4;
+        }
+      }
       return 0;
     }
 

@@ -154,8 +154,8 @@ namespace pipewire_node {
 
       this->offset_x = 0;
       this->offset_y = 0;
-      this->width = 0;
-      this->height = 0;
+      this->width = 1920;
+      this->height = 1080;
       this->logical_width = 0;
       this->logical_height = 0;
 
@@ -167,49 +167,21 @@ namespace pipewire_node {
         } catch (...) {}
       }
 
-      auto monitors = wl::monitors();
-      bool found_monitor = false;
-      if (!display_name.empty()) {
-        for (const auto &monitor : monitors) {
-          if (monitor && monitor->name == display_name) {
-            this->offset_x = monitor->viewport.offset_x;
-            this->offset_y = monitor->viewport.offset_y;
-            this->width = monitor->viewport.width;
-            this->height = monitor->viewport.height;
-            this->logical_width = monitor->viewport.logical_width;
-            this->logical_height = monitor->viewport.logical_height;
-            BOOST_LOG(info) << "[pipewire_node] Matched Wayland monitor "sv << monitor->name 
-                            << " at offset "sv << this->offset_x << "x"sv << this->offset_y 
-                            << " size "sv << this->width << "x"sv << this->height;
-            found_monitor = true;
-            break;
-          }
-        }
+      std::string x_str, y_str;
+      if (lizardbyte::common::get_env("SUNSHINE_PIPEWIRE_OFFSET_X", x_str)) {
+        try {
+          this->offset_x = std::stoi(x_str);
+        } catch (...) {}
       }
-      if (!found_monitor) {
-        for (const auto &monitor : monitors) {
-          if (monitor && (monitor->name.rfind("Meta", 0) == 0 || monitor->name.rfind("Virtual", 0) == 0)) {
-            this->offset_x = monitor->viewport.offset_x;
-            this->offset_y = monitor->viewport.offset_y;
-            this->width = monitor->viewport.width;
-            this->height = monitor->viewport.height;
-            this->logical_width = monitor->viewport.logical_width;
-            this->logical_height = monitor->viewport.logical_height;
-            BOOST_LOG(info) << "[pipewire_node] Matched Wayland monitor "sv << monitor->name 
-                            << " at offset "sv << this->offset_x << "x"sv << this->offset_y 
-                            << " size "sv << this->width << "x"sv << this->height;
-            found_monitor = true;
-            break;
-          }
-        }
+      if (lizardbyte::common::get_env("SUNSHINE_PIPEWIRE_OFFSET_Y", y_str)) {
+        try {
+          this->offset_y = std::stoi(y_str);
+        } catch (...) {}
       }
 
-      if (this->width <= 0) {
-        this->width = 1920;
-      }
-      if (this->height <= 0) {
-        this->height = 1080;
-      }
+      BOOST_LOG(info) << "[pipewire_node] Direct stream node: "sv << target_node 
+                      << " resolution: "sv << this->width << "x"sv << this->height
+                      << " offset: "sv << this->offset_x << "x"sv << this->offset_y;
 
       return 0;
     }
