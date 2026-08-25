@@ -318,8 +318,16 @@ namespace pipewire {
         int n_params = 0;
         std::array<const struct spa_pod *, MAX_PARAMS> params;
 
-        // Add preferred parameters for DMA-BUF with modifiers
-        bool use_dmabuf = n_dmabuf_infos > 0;
+        // CUDA needs its GL importer to consume DMA-BUF frames. Without that
+        // optional build feature (or on a hybrid system), negotiate CPU memory
+        // so the selected encoder receives an actual data pointer.
+        const bool use_dmabuf = n_dmabuf_infos > 0 &&
+                                (mem_type == platf::mem_type_e::vaapi ||
+                                 mem_type == platf::mem_type_e::vulkan
+#ifdef SUNSHINE_BUILD_CUDA
+                                 || (mem_type == platf::mem_type_e::cuda && display_is_nvidia)
+#endif
+                                );
         if (use_dmabuf) {
           for (int i = 0; i < n_dmabuf_infos; i++) {
             auto format_param = build_format_parameter(&pod_builder, width, height, refresh_rate, dmabuf_infos[i].format, dmabuf_infos[i].modifiers, dmabuf_infos[i].n_modifiers);
