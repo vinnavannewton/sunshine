@@ -1275,6 +1275,18 @@ namespace rtsp_stream {
       config.monitor.bitrate = (int) configuredBitrateKbps;
     }
 
+    const auto forced_video_format = config::video.av1_mode >= 2 ? 2 :
+                                      config::video.hevc_mode >= 2 ? 1 :
+                                                                          -1;
+    if (forced_video_format >= 0 && config.monitor.videoFormat != forced_video_format) {
+      BOOST_LOG(error) << "MONITORIZE_STRICT_CODEC_REJECTED: configured codec "sv
+                       << forced_video_format << " but client requested "sv
+                       << config.monitor.videoFormat;
+
+      respond(sock, session, &option, 400, "BAD REQUEST", req->sequenceNumber, {});
+      return;
+    }
+
     if (config.monitor.videoFormat == 1 && video::active_hevc_mode == 1) {
       BOOST_LOG(warning) << "HEVC is disabled, yet the client requested HEVC"sv;
 

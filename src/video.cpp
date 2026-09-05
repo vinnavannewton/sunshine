@@ -3272,6 +3272,13 @@ namespace video {
             break;
           }
 
+          if ((config::video.hevc_mode >= 2 && !encoder->hevc[encoder_t::PASSED]) ||
+              (config::video.av1_mode >= 2 && !encoder->av1[encoder_t::PASSED])) {
+            BOOST_LOG(error) << "MONITORIZE_STRICT_SELECTION_FAILED: encoder ["sv
+                             << encoder->name << "] does not support the requested codec"sv;
+            break;
+          }
+
           // We will return an encoder here even if it fails one of the codec requirements specified by the user
           adjust_encoder_constraints_hevc(encoder);
           adjust_encoder_constraints_av1(encoder);
@@ -3286,6 +3293,11 @@ namespace video {
       if (chosen_encoder == nullptr) {
         BOOST_LOG(error) << "Couldn't find any working encoder matching ["sv << config::video.encoder << ']';
       }
+    }
+    if (chosen_encoder == nullptr && !config::video.encoder.empty()) {
+      BOOST_LOG(fatal) << "MONITORIZE_STRICT_SELECTION_FAILED: requested encoder ["sv
+                       << config::video.encoder << "] is unavailable"sv;
+      return -1;
     }
 
     BOOST_LOG(info) << "// Testing for available encoders, this may generate errors. You can safely ignore those errors. //"sv;
@@ -3332,6 +3344,11 @@ namespace video {
       if (chosen_encoder == nullptr) {
         BOOST_LOG(error) << "Couldn't find any working encoder that meets HEVC/AV1 requirements"sv;
       }
+    }
+
+    if (chosen_encoder == nullptr && (config::video.hevc_mode >= 2 || config::video.av1_mode >= 2)) {
+      BOOST_LOG(fatal) << "MONITORIZE_STRICT_SELECTION_FAILED: no encoder supports the requested codec"sv;
+      return -1;
     }
 
     // If no encoder was specified or the specified encoder was unusable, keep trying
