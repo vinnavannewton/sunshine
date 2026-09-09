@@ -118,6 +118,15 @@ namespace portal {
     static std::string get_file_path() {
       const auto scope = get_portal_token_scope();
       if (!scope.empty()) {
+        if (const char *target = std::getenv("MONITORIZE_CAPTURE_OUTPUT"); target && *target) {
+          std::string suffix;
+          constexpr char hex[] = "0123456789abcdef";
+          for (unsigned char c : std::string(target)) {
+            suffix += hex[c >> 4];
+            suffix += hex[c & 15];
+          }
+          return platf::appdata().string() + "/portal_token_" + std::string(scope) + "_" + suffix;
+        }
         return platf::appdata().string() + "/portal_token_" + std::string(scope);
       }
       return platf::appdata().string() + "/portal_token";
@@ -268,6 +277,15 @@ namespace portal {
         return -1;
       }
 
+      // Reject a restored/selected monitor other than the one requested by
+      // Monitorize. Never use the first portal stream as a substitute.
+      if (const char *target = std::getenv("MONITORIZE_CAPTURE_OUTPUT"); target && *target) {
+        std::erase_if(pipewire_streams, [target](const auto &stream) { return stream.monitor_name != target; });
+        if (pipewire_streams.size() != 1) {
+          BOOST_LOG(error) << "[portalgrab] Selected portal monitor does not match " << target << ". Choose that monitor in the sharing dialog.";
+          return -1;
+        }
+      }
       if (open_pipewire_remote(session_path, pipewire_fd) < 0) {
         return -1;
       }
@@ -369,7 +387,6 @@ namespace portal {
     GDBusProxy *screencast_proxy;
     GDBusProxy *remote_desktop_proxy;
     std::string session_handle;
-
     int create_portal_session(GMainLoop *loop, gchar **session_path_out, const gchar *session_token, bool use_screencast) {
       GDBusProxy *proxy = use_screencast ? screencast_proxy : remote_desktop_proxy;
       const char *session_type = use_screencast ? "ScreenCast" : "RemoteDesktop";
@@ -615,6 +632,7 @@ namespace portal {
         int out_pos_x;
         int out_pos_y;
         result = g_variant_lookup(value, "position", "(ii)", &out_pos_x, &out_pos_y, nullptr);
+        const bool has_pos = result;
         if (!result) {
           BOOST_LOG(warning) << "[portalgrab] Falling back to position 0x0 for stream with resolution "sv << out_width << "x"sv << out_height << "on pipewire node "sv << out_pipewire_node;
           out_pos_x = 0;
@@ -630,11 +648,16 @@ namespace portal {
 
         auto stream = pipewire_streaminfo_t {out_pipewire_node, out_pipewire_object_serial, out_width, out_height, out_pos_x, out_pos_y};
 
-        // Try to match the stream to a monitor_name by position/resolution and update stream info
+        int match_width = out_width, match_height = out_height;
+        g_variant_lookup(value, "logical_size", "(ii)", &match_width, &match_height);
+        // Match logical geometry, not encoded pixel size on scaled displays.
         for (const auto &monitor : wl_monitors) {
-          if (monitor->viewport.offset_x == out_pos_x && monitor->viewport.offset_y == out_pos_y && monitor->viewport.logical_width == out_width && monitor->viewport.logical_height == out_height) {
+          if (has_pos && monitor->viewport.offset_x == out_pos_x && monitor->viewport.offset_y == out_pos_y && monitor->viewport.logical_width == match_width && monitor->viewport.logical_height == match_height) {
+            if (!stream.monitor_name.empty()) {
+              stream.monitor_name.clear(); // Cloned/overlapping outputs are ambiguous.
+              break;
+            }
             stream.monitor_name = monitor->name;
-            break;
           }
         }
 
