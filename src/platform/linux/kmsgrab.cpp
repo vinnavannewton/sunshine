@@ -21,6 +21,7 @@
 // local includes
 #include "cuda.h"
 #include "graphics.h"
+#include "kmsgrab.h"
 #include "src/config.h"
 #include "src/logging.h"
 #include "src/platform/common.h"
@@ -253,6 +254,58 @@ namespace platf {
     };
 
     static std::vector<card_descriptor_t> card_descriptors;
+
+    /**
+     * @brief Capture selection resolved from a configured monitor name or index.
+     */
+    struct monitor_selection_t {
+      std::int64_t monitor_index;  ///< Legacy index in the filtered global monitor list.
+      std::optional<std::string> card_path;  ///< DRM card owning a named connector.
+      std::optional<std::uint32_t> crtc_id;  ///< CRTC driving a named connector.
+    };
+
+    /**
+     * @brief Format the stable KMS display name for a connector.
+     *
+     * @param connector Connector metadata to format.
+     * @return Display name in the form `{connector-type}-{connector-index}`.
+     */
+    static std::string display_name_for_connector(const connector_t &connector) {
+      return std::format("{}-{}", drmModeGetConnectorTypeName(connector.type), connector.index);
+    }
+
+    /**
+     * @brief Check whether a connector list owns the configured display.
+     *
+     * @param connectors Connectors exposed by one DRM card.
+     * @param display_name Configured KMS connector name.
+     * @return True when the card exposes the named connector.
+     */
+    static bool contains_display(const std::vector<connector_t> &connectors, const std::string_view display_name) {
+      if (display_name.empty() || std::ranges::all_of(display_name, ::isdigit)) {
+        return false;
+      }
+
+      return std::ranges::any_of(connectors, [&](const connector_t &connector) {
+        return display_name == display_name_for_connector(connector);
+      });
+    }
+
+    /**
+     * @brief Convert an encoder memory type to its KMS DRM-card filter.
+     *
+     * @param mem_type Encoder memory type selected for capture.
+     * @return DRM-card filter required by the encoder memory type.
+     */
+    static card_filter_e card_filter_for_mem_type(mem_type_e mem_type) {
+      if (mem_type == mem_type_e::cuda) {
+        return card_filter_e::nvidia_only;
+      }
+      if (mem_type == mem_type_e::vaapi) {
+        return card_filter_e::non_nvidia_only;
+      }
+      return card_filter_e::any;
+    }
 
     static std::uint32_t from_view(const std::string_view &string) {
 #ifndef DOXYGEN
@@ -850,27 +903,28 @@ namespace platf {
     }
 
     /**
-     * @brief Map display name to monitor index
+     * @brief Resolve a display name to its stable DRM card, CRTC, and legacy index.
      *
-     * @param display_name Name of the display to determine monitor index for (or monitor index string value)
-     * @return monitor's display index
+     * @param display_name Display connector name or legacy monitor index string.
+     * @return Capture selection for the requested monitor.
      */
-    static int64_t map_display_name_to_monitor_index(const std::string_view &display_name) {
+    static monitor_selection_t map_display_name_to_monitor_selection(const std::string_view &display_name) {
       // Handle (legacy) monitor index strings by converting them to integer
       if (display_name.empty() || std::ranges::all_of(display_name, ::isdigit)) {
-        return util::from_view(display_name);
+        return {util::from_view(display_name), std::nullopt, std::nullopt};
       }
       // display_name is a connector name (not empty and containing non-digits)
       for (auto &card_descriptor : kms::card_descriptors) {
-        for (const auto &monitor_descriptor : card_descriptor.crtc_to_monitor | std::views::values) {
+        for (const auto &[crtc_id, monitor_descriptor] : card_descriptor.crtc_to_monitor) {
           if (display_name == std::format("{}-{}", drmModeGetConnectorTypeName(monitor_descriptor.type), monitor_descriptor.index)) {
-            BOOST_LOG(info) << "Mapped '"sv << display_name << "' to kmsgrab monitor index " << monitor_descriptor.monitor_index;
-            return monitor_descriptor.monitor_index;
+            BOOST_LOG(info) << "Mapped '"sv << display_name << "' to " << card_descriptor.path << " CRTC " << crtc_id
+                            << " (kmsgrab monitor index " << monitor_descriptor.monitor_index << ')';
+            return {monitor_descriptor.monitor_index, card_descriptor.path, crtc_id};
           }
         }
       }
       BOOST_LOG(warning) << "Couldn't map '"sv << display_name << "' to a monitor index. Falling back to first monitor in list (index=0).";
-      return 0;  // Fallback to first index if nothing can be matched
+      return {0, std::nullopt, std::nullopt};  // Fallback to first index if nothing can be matched
     }
 
     /**
@@ -898,7 +952,8 @@ namespace platf {
       int init(const std::string &display_name, const ::video::config_t &config) {
         delay = ::video::capture_frame_interval(config);
 
-        int monitor_index = map_display_name_to_monitor_index(display_name);
+        const auto selection = map_display_name_to_monitor_selection(display_name);
+        const auto monitor_index = selection.monitor_index;
         int monitor = 0;
 
         fs::path card_dir {"/dev/dri"sv};
@@ -910,25 +965,24 @@ namespace platf {
             continue;
           }
 
+          if (selection.card_path && filestring != *selection.card_path) {
+            continue;
+          }
+
           kms::card_t card;
           if (card.init(entry.path().c_str())) {
             continue;
           }
 
-          // Skip non-Nvidia cards if we're looking for CUDA devices
-          // unless NVENC is selected manually by the user
-          if (mem_type == mem_type_e::cuda && !card.is_nvidia()) {
-            BOOST_LOG(debug) << file << " is not a CUDA device"sv;
-            if (config::video.encoder != "nvenc") {
-              continue;
-            }
-          }
-
-          // Skip Nvidia cards if we're looking for VAAPI devices
-          // This is important for hybrid GPU laptops where the display
-          // may be connected through NVIDIA but rendering happens on Intel
-          if (mem_type == mem_type_e::vaapi && card.is_nvidia()) {
-            BOOST_LOG(debug) << file << " is an NVIDIA card, skipping for VAAPI"sv;
+          const auto card_is_nvidia = card.is_nvidia();
+          const auto is_selected_card = selection.card_path.has_value();
+          if (!should_include_card_for_capture(
+                card_filter_for_mem_type(mem_type),
+                card_is_nvidia,
+                is_selected_card,
+                config::video.encoder == "nvenc"
+              )) {
+            BOOST_LOG(debug) << file << " is incompatible with the selected encoder memory type"sv;
             continue;
           }
 
@@ -943,7 +997,8 @@ namespace platf {
               continue;
             }
 
-            if (monitor != monitor_index) {
+            const auto is_selected_crtc = selection.crtc_id && plane->crtc_id == *selection.crtc_id;
+            if ((selection.crtc_id && !is_selected_crtc) || (!selection.crtc_id && monitor != monitor_index)) {
               ++monitor;
               continue;
             }
@@ -2055,26 +2110,27 @@ namespace platf {
         continue;
       }
 
-      // Skip non-Nvidia cards if we're looking for CUDA devices
-      // unless NVENC is selected manually by the user
-      if (hwdevice_type == mem_type_e::cuda && !card.is_nvidia()) {
-        BOOST_LOG(debug) << file << " is not a CUDA device"sv;
-        if (config::video.encoder == "nvenc") {
-          BOOST_LOG(warning) << "Using NVENC with your display connected to a different GPU may not work properly!"sv;
-        } else {
-          continue;
-        }
-      }
-
-      // Skip Nvidia cards if we're looking for VAAPI devices
-      // This is important for hybrid GPU laptops where the display
-      // may be connected through NVIDIA but rendering happens on Intel
-      if (hwdevice_type == mem_type_e::vaapi && card.is_nvidia()) {
-        BOOST_LOG(debug) << file << " is an NVIDIA card, skipping for VAAPI"sv;
+      auto connectors = card.monitors(conn_type_count);
+      const auto owns_requested_display = kms::contains_display(connectors, config::video.output_name);
+      const auto card_is_nvidia = card.is_nvidia();
+      if (!kms::should_include_card_for_capture(
+            kms::card_filter_for_mem_type(hwdevice_type),
+            card_is_nvidia,
+            owns_requested_display,
+            config::video.encoder == "nvenc"
+          )) {
+        BOOST_LOG(debug) << file << " is incompatible with the selected encoder memory type"sv;
         continue;
       }
 
-      auto crtc_to_monitor = kms::map_crtc_to_monitor(card.monitors(conn_type_count));
+      if (owns_requested_display && ((hwdevice_type == mem_type_e::cuda && !card_is_nvidia) || (hwdevice_type == mem_type_e::vaapi && card_is_nvidia))) {
+        BOOST_LOG(info) << "Preserving selected KMS output '"sv << config::video.output_name << "' on "sv << file
+                        << " across encoder discovery"sv;
+      } else if (hwdevice_type == mem_type_e::cuda && !card_is_nvidia && config::video.encoder == "nvenc") {
+        BOOST_LOG(warning) << "Using NVENC with your display connected to a different GPU may not work properly!"sv;
+      }
+
+      auto crtc_to_monitor = kms::map_crtc_to_monitor(connectors);
 
       auto end = std::end(card);
       for (auto plane = std::begin(card); plane != end; ++plane) {
