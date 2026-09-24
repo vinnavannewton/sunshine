@@ -61,3 +61,7 @@
 	path = third-party/wlr-protocols
 	url = https://github.com/LizardByte-infrastructure/wlr-protocols.git
 	branch = master
+[submodule "third-party/inputtino"]
+    path = third-party/inputtino
+    url = https://github.com/games-on-whales/inputtino.git
+    branch = stable
