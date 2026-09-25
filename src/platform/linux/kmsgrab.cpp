@@ -5,6 +5,7 @@
 // standard includes
 #include <errno.h>
 #include <fcntl.h>
+#include <cstring>
 #include <filesystem>
 #include <ranges>
 #include <thread>
@@ -923,8 +924,8 @@ namespace platf {
           }
         }
       }
-      BOOST_LOG(warning) << "Couldn't map '"sv << display_name << "' to a monitor index. Falling back to first monitor in list (index=0).";
-      return {0, std::nullopt, std::nullopt};  // Fallback to first index if nothing can be matched
+      BOOST_LOG(error) << "MONITORIZE_STRICT_KMS_OUTPUT_MISSING: Couldn't map '"sv << display_name << "' to a KMS connector.";
+      return {-1, std::nullopt, std::nullopt};
     }
 
     /**
@@ -1550,6 +1551,15 @@ namespace platf {
           return -1;
         }
 
+        // VKMS scanout DMA-BUFs are CPU-mappable but cannot be imported as
+        // textures by the real GPU on some multi-GPU Wayland desktops.
+        version_t driver {drmGetVersion(card.fd.el)};
+        cpu_map_vkms = driver && driver->name && std::string_view(driver->name) == "vkms";
+        if (cpu_map_vkms) {
+          BOOST_LOG(info) << "Using CPU-mapped KMS frames for VKMS"sv;
+          return 0;
+        }
+
         gbm.reset(gbm::create_device(card.fd.el));
         if (!gbm) {
           BOOST_LOG(error) << "Couldn't create GBM device: ["sv << util::hex(eglGetError()).to_string_view() << ']';
@@ -1711,6 +1721,47 @@ namespace platf {
           return status;
         }
 
+        if (cpu_map_vkms) {
+          if ((sd.fourcc != DRM_FORMAT_XRGB8888 && sd.fourcc != DRM_FORMAT_ARGB8888) ||
+              (sd.modifier != DRM_FORMAT_MOD_LINEAR && sd.modifier != DRM_FORMAT_MOD_INVALID) ||
+              sd.fds[0] < 0 || img_offset_x < 0 || img_offset_y < 0 ||
+              img_offset_x + width > sd.width || img_offset_y + height > sd.height ||
+              sd.pitches[0] < static_cast<std::uint32_t>(sd.width) * 4) {
+            BOOST_LOG(error) << "Unsupported VKMS framebuffer layout for CPU capture"sv;
+            return capture_e::error;
+          }
+          if (!pull_free_image_cb(img_out)) {
+            return capture_e::interrupted;
+          }
+          const auto map_size = static_cast<std::size_t>(sd.offsets[0]) +
+                                static_cast<std::size_t>(sd.pitches[0]) * sd.height;
+          void *mapped = mmap(nullptr, map_size, PROT_READ, MAP_SHARED, fb_fd[0].el, 0);
+          if (mapped == MAP_FAILED) {
+            BOOST_LOG(error) << "Could not map VKMS framebuffer for CPU capture: "sv << strerror(errno);
+            return capture_e::error;
+          }
+          dma_buf_sync sync {};
+          sync.flags = DMA_BUF_SYNC_START | DMA_BUF_SYNC_READ;
+          ioctl(fb_fd[0].el, DMA_BUF_IOCTL_SYNC, &sync);
+          auto *source = static_cast<const std::uint8_t *>(mapped) + sd.offsets[0] +
+                         static_cast<std::size_t>(img_offset_y) * sd.pitches[0] +
+                         static_cast<std::size_t>(img_offset_x) * 4;
+          auto *target = static_cast<std::uint8_t *>(img_out->data);
+          for (int y = 0; y < height; ++y) {
+            std::memcpy(target + static_cast<std::size_t>(y) * img_out->row_pitch,
+                        source + static_cast<std::size_t>(y) * sd.pitches[0],
+                        static_cast<std::size_t>(width) * 4);
+          }
+          sync.flags = DMA_BUF_SYNC_END | DMA_BUF_SYNC_READ;
+          ioctl(fb_fd[0].el, DMA_BUF_IOCTL_SYNC, &sync);
+          munmap(mapped, map_size);
+          img_out->frame_timestamp = frame_timestamp;
+          if (cursor && captured_cursor.visible) {
+            blend_cursor(*img_out);
+          }
+          return capture_e::ok;
+        }
+
         auto rgb_opt = egl::import_source(display.get(), sd);
 
         if (!rgb_opt) {
@@ -1772,6 +1823,7 @@ namespace platf {
       gbm::gbm_t gbm;  ///< GBM device used for buffer allocation.
       egl::display_t display;  ///< EGL display created from the GBM device.
       egl::ctx_t ctx;  ///< EGL context used to copy KMS frames into RAM.
+      bool cpu_map_vkms = false;
     };
 
     /**
